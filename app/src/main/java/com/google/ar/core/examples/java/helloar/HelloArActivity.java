@@ -17,15 +17,23 @@
 package com.google.ar.core.examples.java.helloar;
 
 import android.content.DialogInterface;
+import android.content.pm.ApplicationInfo;
+import android.content.pm.PackageManager;
 import android.content.res.Resources;
+import android.graphics.SurfaceTexture;
 import android.opengl.GLES20;
 import android.opengl.GLSurfaceView;
 import android.os.Bundle;
 import androidx.appcompat.app.AlertDialog;
 import androidx.appcompat.app.AppCompatActivity;
 import android.util.Log;
+import android.util.Size;
 import android.view.MotionEvent;
+import android.view.Surface;
+import android.view.SurfaceHolder;
+import android.view.SurfaceView;
 import android.view.View;
+import android.view.ViewGroup;
 import android.widget.ImageButton;
 import android.widget.Toast;
 import com.google.ar.core.Anchor;
@@ -61,8 +69,16 @@ import com.google.ar.core.exceptions.UnavailableArcoreNotInstalledException;
 import com.google.ar.core.exceptions.UnavailableDeviceNotCompatibleException;
 import com.google.ar.core.exceptions.UnavailableSdkTooOldException;
 import com.google.ar.core.exceptions.UnavailableUserDeclinedInstallationException;
+import com.google.mediapipe.components.CameraHelper;
+import com.google.mediapipe.components.CameraXPreviewHelper;
 import com.google.mediapipe.components.ExternalTextureConverter;
+import com.google.mediapipe.components.FrameProcessor;
+import com.google.mediapipe.formats.proto.LandmarkProto.NormalizedLandmark;
+import com.google.mediapipe.formats.proto.LandmarkProto.NormalizedLandmarkList;
+import com.google.mediapipe.framework.AndroidAssetUtil;
+import com.google.mediapipe.framework.PacketGetter;
 import com.google.mediapipe.glutil.EglManager;
+import com.google.protobuf.InvalidProtocolBufferException;
 
 import java.io.IOException;
 import java.util.ArrayList;
@@ -107,6 +123,16 @@ public class HelloArActivity extends AppCompatActivity implements GLSurfaceView.
   //MediaPipe
   private EglManager eglManager;
   private ExternalTextureConverter converter;
+  private CameraXPreviewHelper cameraHelper;
+  private SurfaceTexture previewFrameTexture;
+  private ApplicationInfo applicationInfo;
+  private FrameProcessor processor;
+  private static final String BINARY_GRAPH_NAME = "hand_detection_mobile_gpu.binarypb";
+  private static final String INPUT_VIDEO_STREAM_NAME = "input_video";
+  private static final String OUTPUT_VIDEO_STREAM_NAME = "output_video";
+  private static final String OUTPUT_HAND_PRESENCE_STREAM_NAME = "hand_presence";
+  private static final String OUTPUT_LANDMARKS_STREAM_NAME = "hand_landmarks";
+  private static final boolean FLIP_FRAMES_VERTICALLY = true;
 
   // Anchors created from taps used for object placing with a given color.
   private static class ColoredAnchor {
@@ -119,18 +145,120 @@ public class HelloArActivity extends AppCompatActivity implements GLSurfaceView.
     }
   }
 
+  static {
+    // Load all native libraries needed by the app.
+    System.loadLibrary("mediapipe_jni");
+    System.loadLibrary("opencv_java3");
+  }
+
   private final ArrayList<ColoredAnchor> anchors = new ArrayList<>();
 
   @Override
   protected void onCreate(Bundle savedInstanceState) {
     super.onCreate(savedInstanceState);
     setContentView(R.layout.activity_main);
-    surfaceView = findViewById(R.id.surfaceview);
+    surfaceView = new GLSurfaceView(this);
+    setUpSurfaceView();
+
+    depthSettings.onCreate(this);
+    ImageButton settingsButton = findViewById(R.id.settings_button);
+    settingsButton.setOnClickListener(this::launchSettingsMenuDialog);
+    AndroidAssetUtil.initializeNativeAssetManager(this);
+    eglManager = new EglManager(null);
+
+    processor =
+            new FrameProcessor(
+                    this,
+                    eglManager.getNativeContext(),
+                    BINARY_GRAPH_NAME,
+                    INPUT_VIDEO_STREAM_NAME,
+                    OUTPUT_VIDEO_STREAM_NAME);
+    processor.getVideoSurfaceOutput().setFlipY(FLIP_FRAMES_VERTICALLY);
+    processor.addPacketCallback(
+            OUTPUT_HAND_PRESENCE_STREAM_NAME,
+            (packet) -> {
+              Boolean handPresence = PacketGetter.getBool(packet);
+              if (!handPresence) {
+                Log.d(
+                        TAG,
+                        "[TS:" + packet.getTimestamp() + "] Hand presence is false, no hands detected.");
+              }
+            });
+
+    // To show verbose logging, run:
+    // adb shell setprop log.tag.MainActivity VERBOSE
+    if (Log.isLoggable(TAG, Log.VERBOSE)) {
+      processor.addPacketCallback(
+              OUTPUT_LANDMARKS_STREAM_NAME,
+              (packet) -> {
+                byte[] landmarksRaw = PacketGetter.getProtoBytes(packet);
+                try {
+                  NormalizedLandmarkList landmarks = NormalizedLandmarkList.parseFrom(landmarksRaw);
+                  if (landmarks == null) {
+                    Log.v(TAG, "[TS:" + packet.getTimestamp() + "] No hand landmarks.");
+                    return;
+                  }
+                  // Note: If hand_presence is false, these landmarks are useless.
+                  Log.v(
+                          TAG,
+                          "[TS:"
+                                  + packet.getTimestamp()
+                                  + "] #Landmarks for hand: "
+                                  + landmarks.getLandmarkCount());
+                  Log.v(TAG, getLandmarksDebugString(landmarks));
+                } catch (InvalidProtocolBufferException e) {
+                  Log.e(TAG, "Couldn't Exception received - " + e);
+                  return;
+                }
+              });
+    }
+  }
+
+  private static String getLandmarksDebugString(NormalizedLandmarkList landmarks) {
+    int landmarkIndex = 0;
+    String landmarksString = "";
+    for (NormalizedLandmark landmark : landmarks.getLandmarkList()) {
+      landmarksString +=
+              "\t\tLandmark["
+                      + landmarkIndex
+                      + "]: ("
+                      + landmark.getX()
+                      + ", "
+                      + landmark.getY()
+                      + ", "
+                      + landmark.getZ()
+                      + ")\n";
+      ++landmarkIndex;
+    }
+    return landmarksString;
+  }
+
+  private void setUpSurfaceView() {
+    surfaceView.setVisibility(View.GONE);
+    ViewGroup viewGroup = findViewById(R.id.preview_display_layout);
+    viewGroup.addView(surfaceView);
+
     displayRotationHelper = new DisplayRotationHelper(/*context=*/ this);
 
     // Set up tap listener.
     tapHelper = new TapHelper(/*context=*/ this);
     surfaceView.setOnTouchListener(tapHelper);
+    surfaceView.getHolder().addCallback(new SurfaceHolder.Callback() {
+      @Override
+      public void surfaceCreated(SurfaceHolder holder) {
+
+      }
+
+      @Override
+      public void surfaceChanged(SurfaceHolder holder, int format, int width, int height) {
+
+      }
+
+      @Override
+      public void surfaceDestroyed(SurfaceHolder holder) {
+        processor.getVideoSurfaceOutput().setSurface(null);
+      }
+    });
 
     // Set up renderer.
     surfaceView.setPreserveEGLContextOnPause(true);
@@ -142,17 +270,14 @@ public class HelloArActivity extends AppCompatActivity implements GLSurfaceView.
 
     installRequested = false;
     calculateUVTransform = true;
-
-    depthSettings.onCreate(this);
-    ImageButton settingsButton = findViewById(R.id.settings_button);
-    settingsButton.setOnClickListener(this::launchSettingsMenuDialog);
-    eglManager = new EglManager(null);
   }
 
   @Override
   protected void onResume() {
     super.onResume();
-
+    converter = new ExternalTextureConverter(eglManager.getContext());
+    converter.setFlipY(FLIP_FRAMES_VERTICALLY);
+    converter.setConsumer(processor);
     if (session == null) {
       Exception exception = null;
       String message = null;
@@ -205,7 +330,7 @@ public class HelloArActivity extends AppCompatActivity implements GLSurfaceView.
         return;
       }
     }
-
+    startCamera();
     // Note that order matters - see the note in onPause(), the reverse applies here.
     try {
       session.resume();
@@ -218,7 +343,21 @@ public class HelloArActivity extends AppCompatActivity implements GLSurfaceView.
     surfaceView.onResume();
     displayRotationHelper.onResume();
 
-    converter = new ExternalTextureConverter(eglManager.getContext());
+  }
+
+  public void startCamera() {
+    cameraHelper = new CameraXPreviewHelper();
+    cameraHelper.setOnCameraStartedListener(
+            surfaceTexture -> {
+              previewFrameTexture = surfaceTexture;
+              // Make the display view visible to start showing the preview.
+              surfaceView.setVisibility(View.VISIBLE);
+            });
+//    CameraHelper.CameraFacing cameraFacing =
+//            applicationInfo.metaData.getBoolean("cameraFacingFront", false)
+//                    ? CameraHelper.CameraFacing.FRONT
+//                    : CameraHelper.CameraFacing.BACK;
+    cameraHelper.startCamera(this, CameraHelper.CameraFacing.BACK, /*surfaceTexture=*/ null);
   }
 
   @Override
@@ -276,13 +415,24 @@ public class HelloArActivity extends AppCompatActivity implements GLSurfaceView.
     } catch (IOException e) {
       Log.e(TAG, "Failed to read an asset file", e);
     }
+
+    processor.getVideoSurfaceOutput().setSurface(this.surfaceView.getHolder().getSurface());
   }
 
   @Override
   public void onSurfaceChanged(GL10 gl, int width, int height) {
     displayRotationHelper.onSurfaceChanged(width, height);
     GLES20.glViewport(0, 0, width, height);
+    Size viewSize = new Size(width, height);
+    Size displaySize = cameraHelper.computeDisplaySizeFromViewSize(viewSize);
+
+    // Connect the converter to the camera-preview frames as its input (via
+    // previewFrameTexture), and configure the output width and height as the computed
+    // display size.
+    converter.setSurfaceTextureAndAttachToGLContext(
+            previewFrameTexture, displaySize.getWidth(), displaySize.getHeight());
   }
+
 
   @Override
   public void onDrawFrame(GL10 gl) {
