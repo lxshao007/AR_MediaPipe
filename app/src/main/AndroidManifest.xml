@@ -18,11 +18,14 @@
     xmlns:tools="http://schemas.android.com/tools"
     package="com.google.ar.core.examples.java.helloar">
 
+
+  <uses-feature android:name="android.hardware.camera" />
   <uses-permission android:name="android.permission.CAMERA"/>
   <!-- Limits app visibility in the Google Play Store to ARCore supported devices
        (https://developers.google.com/ar/discover/supported-devices). -->
   <uses-feature android:name="android.hardware.camera.ar" android:required="true"/>
   <uses-feature android:glEsVersion="0x00020000" android:required="true" />
+
 
   <application
       android:allowBackup="false"
